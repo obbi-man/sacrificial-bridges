@@ -17,98 +17,162 @@ def create_tree_support(
     branch_length: float = 1.5,
     branch_radius: float = 0.3,
     depth: int = 2,
+    branch_angle: float = 45.0,
 ) -> trimesh.Trimesh:
     """Создаёт mesh tree support.
 
+    Архитектура:
+        - Ствол (цилиндр) от стола до первой развилки
+        - На каждом уровне — N веток под углом branch_angle
+        - Каждая ветка может иметь свои sub-ветки (depth)
+
     Args:
         target: точка (x, y, z) где overhang требует поддержки
-        base_z: Z стола (обычно 0)
-        trunk_radius: радиус ствола (мм)
-        trunk_height: высота ствола до первой ветки (если None — авто)
-        branch_length: длина веток (мм)
-        branch_radius: радиус веток (мм)
-        depth: глубина ветвления (2-3 норм)
-
-    Returns:
-        trimesh.Trimesh — mesh tree support
+        base_z: Z стола
+        trunk_radius: радиус ствола
+        trunk_height: высота до первой развилки (None = авто)
+        branch_length: длина веток
+        branch_radius: радиус веток
+        depth: количество уровней ветвления (1-3)
+        branch_angle: угол веток относительно вертикали (градусы)
     """
     x, y, z = target
-    if z <= base_z:
-        # Overhang уже на столе
+    if z <= base_z + 1.0:
+        # Overhang слишком близко к столу — не нужен tree support
         return trimesh.Trimesh()
 
+    # Авто-высота ствола: ~50% от высоты до target
     trunk_h = trunk_height or (z - base_z) * 0.5
+    # Ствол не ниже 5мм и не выше половины
+    trunk_h = max(min(trunk_h, (z - base_z) * 0.7), 3.0)
 
     meshes = []
 
-    # Ствол — цилиндр
+    # === Ствол ===
     trunk = trimesh.creation.cylinder(
         radius=trunk_radius,
         height=trunk_h,
-        sections=8,
+        sections=10,
     )
-    # Позиция: середина ствола
+    # Цилиндр по умолчанию по Y. Развернём по Z.
+    trunk.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0]))
+    # Позиция: центр ствола
     trunk.apply_translation([x, y, base_z + trunk_h / 2])
     meshes.append(trunk)
 
-    # Ветки на разных высотах
-    branch_heights = []
+    # === Ветки ===
+    # Уровни ветвления
+    branch_levels = []
     if depth >= 1:
-        branch_heights.append(base_z + trunk_h)
+        # Первая развилка — наверху ствола
+        branch_levels.append({
+            "height": base_z + trunk_h,
+            "count": 4,
+            "radius": branch_radius,
+            "length": branch_length,
+        })
     if depth >= 2:
-        branch_heights.append(base_z + trunk_h + (z - base_z - trunk_h) * 0.5)
+        # Вторая развилка — посередине между стволом и target
+        mid = base_z + trunk_h + (z - base_z - trunk_h) * 0.5
+        if mid < z - branch_length:
+            branch_levels.append({
+                "height": mid,
+                "count": 4,
+                "radius": branch_radius * 0.75,
+                "length": branch_length * 0.8,
+            })
     if depth >= 3:
-        branch_heights.append(z - branch_length * 0.5)
+        # Третья — у самого target
+        if z - branch_length * 0.5 > base_z + trunk_h:
+            branch_levels.append({
+                "height": z - branch_length * 0.5,
+                "count": 3,
+                "radius": branch_radius * 0.5,
+                "length": branch_length * 0.5,
+            })
 
-    # Углы для веток (равномерно вокруг)
-    for i, bh in enumerate(branch_heights):
-        if bh >= z:
-            continue
+    for level_idx, level in enumerate(branch_levels):
+        n_branches = level["count"]
+        bh = level["height"]
+        b_rad = level["radius"]
+        b_len = level["length"]
 
-        n_branches = 4 if i == 0 else 3
         for j in range(n_branches):
-            angle = (2 * math.pi * j / n_branches) + (i * 0.5)
-            # Ветка растёт от ствола наружу
-            direction = np.array([math.cos(angle), math.sin(angle), 0])
-            end_point = np.array([x, y, bh]) + direction * branch_length * (1.5 if i == 0 else 1.2)
-            end_point[2] = min(end_point[2], z - 0.5)  # не выше target
+            # Угол вокруг вертикали
+            phi = (2 * math.pi * j / n_branches) + (level_idx * 0.7)
+            # Наклон ветки
+            theta = math.radians(branch_angle)  # от вертикали
 
+            # Направление ветки (в сферических координатах)
+            direction = np.array([
+                math.sin(theta) * math.cos(phi),
+                math.sin(theta) * math.sin(phi),
+                math.cos(theta),
+            ])
+
+            # Создаём ветку как цилиндр по Y
             branch = trimesh.creation.cylinder(
-                radius=branch_radius * (1.0 - i * 0.2),
-                height=branch_length,
+                radius=b_rad,
+                height=b_len,
                 sections=6,
             )
 
-            # Поворачиваем ветку: должна идти от (x, y, bh) в направлении direction
-            # Цилиндр по умолчанию по Y. Повернём к direction.
+            # Поворачиваем: ось Y → direction
             default_axis = np.array([0.0, 1.0, 0.0])
-            target_axis = np.array([direction[0], direction[1], 0.0])
-            target_axis_norm = target_axis / (np.linalg.norm(target_axis) + 1e-9)
-
-            v = np.cross(default_axis, target_axis_norm)
+            v = np.cross(default_axis, direction)
             s = np.linalg.norm(v)
-            c = np.dot(default_axis, target_axis_norm)
+            c = np.dot(default_axis, direction)
 
             if s < 1e-6:
-                if c > 0:
-                    rotation = np.eye(4)
-                else:
-                    rotation = trimesh.transformations.rotation_matrix(
-                        np.pi, [0, 0, 1]
-                    )
+                rotation = np.eye(4) if c > 0 else trimesh.transformations.rotation_matrix(np.pi, [1, 0, 0])
             else:
                 v = v / s
-                angle_rad = np.arccos(np.clip(c, -1.0, 1.0))
-                rotation = trimesh.transformations.rotation_matrix(angle_rad, v)
+                angle = math.acos(max(-1.0, min(1.0, c)))
+                rotation = trimesh.transformations.rotation_matrix(angle, v)
 
             branch.apply_transform(rotation)
-            # Центрируем: начало ветки в (x, y, bh), длина branch_length
-            # После поворота ветка длиной branch_length идёт от (0,0,0) к (0, branch_length, 0)
-            # Новое начало = (x, y, bh), длина = branch_length
+
+            # Позиция: начало ветки в (x, y, bh), ветка растёт в направлении direction
             start_point = np.array([x, y, bh])
-            center = start_point + target_axis_norm * (branch_length / 2)
+            center = start_point + direction * (b_len / 2)
             branch.apply_translation(center)
             meshes.append(branch)
+
+            # Sub-ветки (на концах основных)
+            if depth >= 2 and level_idx == 0:
+                # Добавляем маленькие "листочки" — маленькие цилиндры в конце
+                tip = start_point + direction * b_len
+                for k in range(2):
+                    sub_angle = math.radians(30 + 30 * k)
+                    sub_direction = direction.copy()
+                    # Слегка поворачиваем
+                    if k == 0:
+                        sub_direction[2] += 0.3
+                    else:
+                        sub_direction[2] -= 0.3
+                    sub_direction = sub_direction / np.linalg.norm(sub_direction)
+
+                    sub_branch = trimesh.creation.cylinder(
+                        radius=b_rad * 0.6,
+                        height=b_len * 0.4,
+                        sections=5,
+                    )
+
+                    v2 = np.cross(default_axis, sub_direction)
+                    s2 = np.linalg.norm(v2)
+                    c2 = np.dot(default_axis, sub_direction)
+
+                    if s2 < 1e-6:
+                        rot2 = np.eye(4) if c2 > 0 else trimesh.transformations.rotation_matrix(np.pi, [1, 0, 0])
+                    else:
+                        v2 = v2 / s2
+                        angle2 = math.acos(max(-1.0, min(1.0, c2)))
+                        rot2 = trimesh.transformations.rotation_matrix(angle2, v2)
+
+                    sub_branch.apply_transform(rot2)
+                    sub_center = tip + sub_direction * (b_len * 0.2)
+                    sub_branch.apply_translation(sub_center)
+                    meshes.append(sub_branch)
 
     return trimesh.util.concatenate(meshes) if meshes else trimesh.Trimesh()
 
@@ -118,6 +182,8 @@ def build_tree_supports(
     base_z: float = 0.0,
     trunk_radius: float = 0.6,
     branch_length: float = 1.5,
+    depth: int = 2,
+    branch_angle: float = 45.0,
 ) -> list[trimesh.Trimesh]:
     """Строит mesh tree supports для всех решений со стратегией tree."""
     trees = []
@@ -129,6 +195,8 @@ def build_tree_supports(
             base_z=base_z,
             trunk_radius=trunk_radius,
             branch_length=branch_length,
+            depth=depth,
+            branch_angle=branch_angle,
         )
         if len(mesh.vertices) > 0:
             trees.append(mesh)
